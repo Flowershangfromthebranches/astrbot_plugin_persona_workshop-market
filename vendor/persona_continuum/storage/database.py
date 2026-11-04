@@ -1,0 +1,999 @@
+from __future__ import annotations
+
+import contextlib
+import json
+import sqlite3
+import threading
+from collections.abc import Iterator
+from datetime import UTC, datetime
+from pathlib import Path
+from types import TracebackType
+from typing import Any
+
+from persona_continuum.storage.migrations import SCHEMA_SQL
+
+
+class Database:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._conn: sqlite3.Connection | None = None
+        self._owner_thread: int | None = None
+        self._local = threading.local()
+        self._thread_connections: list[sqlite3.Connection] = []
+        self._threads_lock = threading.Lock()
+
+    def _connect(self, *, read_only: bool = False) -> sqlite3.Connection:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        connection = (
+            sqlite3.connect(
+                f"{self.path.resolve().as_uri()}?mode=ro",
+                uri=True,
+                timeout=30.0,
+                check_same_thread=False,
+            )
+            if read_only
+            else sqlite3.connect(self.path, timeout=30.0, check_same_thread=False)
+        )
+        connection.row_factory = sqlite3.Row
+        if not read_only:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA synchronous = NORMAL")
+        connection.execute("PRAGMA busy_timeout = 30000")
+        return connection
+
+    def _thread_connection(self, kind: str) -> sqlite3.Connection:
+        connection: sqlite3.Connection | None = getattr(self._local, kind, None)
+        if connection is None:
+            connection = self._connect(read_only=kind == "reader")
+            setattr(self._local, kind, connection)
+            # check_same_thread is off only so close() can release it; each
+            # of these connections is used by exactly one thread.
+            with self._threads_lock:
+                self._thread_connections.append(connection)
+        return connection
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        """The calling thread's read-write connection.
+
+        The thread that opens the database (the event loop) owns the shared
+        connection.  Any other thread gets its own: Python's sqlite3 caches
+        prepared statements per connection, and the same SQL run from two
+        threads on one connection fails with ``InterfaceError: API misuse``.
+        WAL lets these connections read concurrently; SQLite queues writers.
+        """
+
+        if self._owner_thread is not None and threading.get_ident() != self._owner_thread:
+            return self._thread_connection("writer")
+        if self._conn is None:
+            self._conn = self._connect()
+            self._owner_thread = threading.get_ident()
+        return self._conn
+
+    def migrate(self) -> None:
+        self.conn.executescript(SCHEMA_SQL)
+        self._ensure_runtime_branch_columns()
+        self._ensure_research_artifact_columns()
+        self._ensure_persona_research_quality_columns()
+        self._ensure_world_tables()
+        self._ensure_world_runtime_columns()
+        self._ensure_world_binding_profile_columns()
+        self._ensure_profile_enrichment_columns()
+        self._ensure_job_center_columns()
+        self._ensure_identity_spec_v2_columns()
+        self._ensure_research_capability_cache_columns()
+        self._ensure_room_protocol_state()
+        self._ensure_room_transcript_identity()
+        self._ensure_memory_episode_schema()
+        self.conn.commit()
+
+    def _ensure_memory_episode_schema(self) -> None:
+        """Record the Episode migration and keep its tables forward-compatible.
+
+        Additive and non-destructive: the tables are created by ``SCHEMA_SQL``
+        with ``IF NOT EXISTS``, only missing columns are ever added, and no
+        existing table (raw transcripts, memories, lineage) is touched.  The
+        migration id is stamped so an operator can tell which schema a data
+        directory is on without guessing from the table list.
+        """
+
+        from persona_continuum.storage.migrations import (
+            MEMORY_EPISODES_MIGRATION_ID,
+            SHARED_USER_PROVENANCE_MIGRATION_ID,
+        )
+
+        tables = self._all_tables()
+        if "memory_episodes" not in tables or "memory_episode_turns" not in tables:
+            # SCHEMA_SQL failed to create them, which means the database is not
+            # writable or is not the file we think it is.  Fail closed rather
+            # than let the Episode layer run against missing tables.
+            raise RuntimeError("memory_episode_schema_missing")
+        expected_columns = {
+            "memory_episodes": (
+                "summary_status",
+                "consolidation_attempts",
+                "last_error",
+                "consolidated_at",
+                "visibility",
+                "provenance",
+                "material_scope",
+                "source_range_hash",
+                "fact_extraction_status",
+                "fact_extraction_attempts",
+                "fact_extraction_error",
+                "facts_extracted_at",
+                "thread_resolution_status",
+                "thread_resolution_attempts",
+                "thread_resolution_error",
+                "threads_resolved_at",
+            ),
+            "memory_episode_turns": ("source_kind", "token_estimate", "occurred_at"),
+        }
+        existing = {
+            table: {str(row["name"]) for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            for table in expected_columns
+        }
+        for table, columns in expected_columns.items():
+            for column in columns:
+                if column in existing[table]:
+                    continue
+                # Only ever additive, always nullable/defaulted: an older row
+                # keeps a valid value and nothing is dropped.
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+        self.conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at, details_json) "
+            "VALUES (?, ?, ?)",
+            (
+                MEMORY_EPISODES_MIGRATION_ID,
+                datetime.now(UTC).isoformat(),
+                json.dumps({"tables": sorted(expected_columns)}, ensure_ascii=False),
+            ),
+        )
+        self.conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at, details_json) "
+            "VALUES (?, ?, ?)",
+            (
+                SHARED_USER_PROVENANCE_MIGRATION_ID,
+                datetime.now(UTC).isoformat(),
+                json.dumps(
+                    {"source_kinds": ["session_turn", "shared_user"]}, ensure_ascii=False
+                ),
+            ),
+        )
+        self._ensure_semantic_fact_schema()
+        self._ensure_active_thread_schema()
+        self._ensure_hierarchical_summary_schema()
+
+    def _ensure_hierarchical_summary_schema(self) -> None:
+        """Phase 6 tables: additive, version-stamped, never destructive."""
+
+        from persona_continuum.storage.migrations import (
+            HIERARCHICAL_SUMMARIES_MIGRATION_ID,
+            HIERARCHY_DEPENDENCY_MIGRATION_ID,
+        )
+
+        tables = self._all_tables()
+        required = ("memory_hierarchical_summaries", "memory_summary_sources")
+        if any(table not in tables for table in required):
+            raise RuntimeError("hierarchical_summary_schema_missing")
+        expected_columns = {
+            "memory_hierarchical_summaries": (
+                "level",
+                "summary_type",
+                "sequence",
+                "started_at",
+                "ended_at",
+                "status",
+                "source_count",
+                "source_token_estimate",
+                "consolidation_version",
+                "summary_status",
+                "consolidation_attempts",
+                "last_error",
+                "consolidated_at",
+                "source_range_hash",
+                "source_fingerprint",
+                "consolidated_fingerprint",
+                "parent_summary_id",
+                "visibility",
+                "material_scope",
+            ),
+            "memory_summary_sources": (
+                "source_type",
+                "position",
+                "started_at",
+                "ended_at",
+                "importance",
+            ),
+        }
+        existing = {
+            table: {str(row["name"]) for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            for table in expected_columns
+        }
+        for table, columns in expected_columns.items():
+            for column in columns:
+                if column in existing[table]:
+                    continue
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+        self.conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at, details_json) "
+            "VALUES (?, ?, ?)",
+            (
+                HIERARCHICAL_SUMMARIES_MIGRATION_ID,
+                datetime.now(UTC).isoformat(),
+                json.dumps({"tables": sorted(expected_columns)}, ensure_ascii=False),
+            ),
+        )
+        # Phase 6.1 stamps the dependency-hardening columns separately: the two
+        # fingerprints are what let a parent notice that a child changed.
+        self.conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at, details_json) "
+            "VALUES (?, ?, ?)",
+            (
+                HIERARCHY_DEPENDENCY_MIGRATION_ID,
+                datetime.now(UTC).isoformat(),
+                json.dumps(
+                    {"columns": ["source_fingerprint", "consolidated_fingerprint"]},
+                    ensure_ascii=False,
+                ),
+            ),
+        )
+
+    def rollback_hierarchical_summaries(self) -> None:
+        """Apply the documented Phase 6 rollback (summary tables only)."""
+
+        from persona_continuum.storage.migrations import HIERARCHICAL_SUMMARIES_DOWN_SQL
+
+        self.conn.executescript(HIERARCHICAL_SUMMARIES_DOWN_SQL)
+        self.conn.commit()
+
+    def _ensure_active_thread_schema(self) -> None:
+        """Phase 5 tables: additive, version-stamped, never destructive."""
+
+        from persona_continuum.storage.migrations import ACTIVE_THREADS_MIGRATION_ID
+
+        tables = self._all_tables()
+        required = (
+            "memory_active_threads",
+            "memory_thread_events",
+            "memory_thread_sources",
+            "memory_thread_facts",
+            "memory_thread_link_candidates",
+        )
+        if any(table not in tables for table in required):
+            raise RuntimeError("active_thread_schema_missing")
+        expected_columns = {
+            "memory_active_threads": (
+                "thread_key",
+                "thread_type",
+                "status",
+                "opened_at",
+                "last_activity_at",
+                "resolved_at",
+                "cancelled_at",
+                "stale_at",
+                "current_state_json",
+                "consolidation_version",
+                "visibility",
+                "material_scope",
+                "related_previous_thread_id",
+            ),
+            "memory_thread_events": (
+                "event_key",
+                "state_json",
+                "source_episode_id",
+                "source_turn_id",
+                "source_availability",
+                "metadata_json",
+            ),
+            "memory_thread_sources": (
+                "source_type",
+                "episode_id",
+                "turn_id",
+                "session_id",
+                "room_id",
+                "evidence_role",
+                "excerpt_available",
+            ),
+            "memory_thread_facts": ("relation",),
+            "memory_thread_link_candidates": (
+                "episode_id",
+                "thread_id",
+                "confidence",
+                "reason",
+                "status",
+                "resolved_at",
+                "metadata_json",
+            ),
+        }
+        existing = {
+            table: {str(row["name"]) for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            for table in expected_columns
+        }
+        for table, columns in expected_columns.items():
+            for column in columns:
+                if column in existing[table]:
+                    continue
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+        self.conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at, details_json) "
+            "VALUES (?, ?, ?)",
+            (
+                ACTIVE_THREADS_MIGRATION_ID,
+                datetime.now(UTC).isoformat(),
+                json.dumps({"tables": sorted(expected_columns)}, ensure_ascii=False),
+            ),
+        )
+
+    def rollback_active_threads(self) -> None:
+        """Apply the documented Phase 5 rollback (Thread tables only)."""
+
+        from persona_continuum.storage.migrations import ACTIVE_THREADS_DOWN_SQL
+
+        self.conn.executescript(ACTIVE_THREADS_DOWN_SQL)
+        self.conn.commit()
+
+    def _ensure_semantic_fact_schema(self) -> None:
+        """Phase 4 tables: additive, version-stamped, never destructive."""
+
+        from persona_continuum.storage.migrations import SEMANTIC_FACTS_MIGRATION_ID
+
+        tables = self._all_tables()
+        if "memory_semantic_facts" not in tables or "memory_fact_sources" not in tables:
+            raise RuntimeError("semantic_fact_schema_missing")
+        expected_columns = {
+            "memory_semantic_facts": (
+                "fact_key",
+                "value_key",
+                "origin",
+                "durability",
+                "plan_status",
+                "evidence_count",
+                "last_confirmed_at",
+                "valid_from",
+                "valid_until",
+                "temporal_expression",
+                "temporal_normalized",
+                "temporal_confidence",
+                "superseded_by_fact_id",
+                "supersedes_fact_id",
+                "extraction_version",
+                "visibility",
+                "material_scope",
+            ),
+            "memory_fact_sources": (
+                "source_type",
+                "episode_id",
+                "turn_id",
+                "session_id",
+                "room_id",
+                "evidence_role",
+                "excerpt_available",
+            ),
+        }
+        existing = {
+            table: {str(row["name"]) for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            for table in expected_columns
+        }
+        for table, columns in expected_columns.items():
+            for column in columns:
+                if column in existing[table]:
+                    continue
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+        self.conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (migration_id, applied_at, details_json) "
+            "VALUES (?, ?, ?)",
+            (
+                SEMANTIC_FACTS_MIGRATION_ID,
+                datetime.now(UTC).isoformat(),
+                json.dumps({"tables": sorted(expected_columns)}, ensure_ascii=False),
+            ),
+        )
+
+    def rollback_semantic_facts(self) -> None:
+        """Apply the documented Phase 4 rollback (Fact tables only)."""
+
+        from persona_continuum.storage.migrations import SEMANTIC_FACTS_DOWN_SQL
+
+        self.conn.executescript(SEMANTIC_FACTS_DOWN_SQL)
+        self.conn.commit()
+
+    def rollback_memory_episodes(self) -> None:
+        """Apply the documented Phase 3 rollback (drops only the Episode tables).
+
+        Exposed for operators and for the migration test; never called during
+        startup.  Raw transcripts, memories and lineage are untouched.
+        """
+
+        from persona_continuum.storage.migrations import MEMORY_EPISODES_DOWN_SQL
+
+        self.conn.executescript(MEMORY_EPISODES_DOWN_SQL)
+        self.conn.commit()
+    def _ensure_room_transcript_identity(self) -> None:
+        """Make (room_id, turn_id) an identity key for replay-safe injection.
+
+        Legacy databases may hold duplicated turn rows from pre-idempotency
+        retries; the oldest row wins and the unique index then guarantees the
+        protocol/user message dedup keys hold for every future insert.
+        """
+        if "room_transcripts" not in self._all_tables():
+            return
+        self.conn.execute(
+            """
+            DELETE FROM room_transcripts WHERE rowid NOT IN (
+              SELECT MIN(rowid) FROM room_transcripts GROUP BY room_id, turn_id
+            )
+            """
+        )
+        with contextlib.suppress(Exception):
+            self.conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_room_transcripts_room_turn
+                ON room_transcripts(room_id, turn_id)
+                """
+            )
+
+    def _ensure_room_protocol_state(self) -> None:
+        """Backfill additive protocol defaults into legacy room JSON in place."""
+
+        if "rooms" not in self._all_tables():
+            return
+        rows = self.conn.execute("SELECT id, state_json FROM rooms").fetchall()
+        for row in rows:
+            try:
+                state = json.loads(str(row["state_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(state, dict):
+                continue
+            changed = False
+            defaults: dict[str, Any] = {
+                "protocol": "free_discussion",
+                "protocol_config": {},
+                "shared_context": {},
+                "protocol_state": {},
+                "protocol_events": [],
+            }
+            for key, value in defaults.items():
+                if key not in state:
+                    state[key] = value
+                    changed = True
+            participants = state.get("participants")
+            if isinstance(participants, list):
+                for participant in participants:
+                    if isinstance(participant, dict) and "role" not in participant:
+                        participant["role"] = "member"
+                        changed = True
+            if changed:
+                self.conn.execute(
+                    "UPDATE rooms SET state_json = ? WHERE id = ?",
+                    (json.dumps(state, ensure_ascii=False, separators=(",", ":")), row["id"]),
+                )
+
+    def _ensure_world_runtime_columns(self) -> None:
+        if "worlds" in self._all_tables():
+            info = self.conn.execute("PRAGMA table_info(worlds)").fetchall()
+            cols = {str(r["name"]) for r in info}
+            for col_name in (
+                "builder_runtime_json",
+                "default_actor_runtime_json",
+                "director_runtime_json",
+                "evaluator_runtime_json",
+            ):
+                if col_name not in cols:
+                    with contextlib.suppress(Exception):
+                        self.conn.execute(
+                            f"ALTER TABLE worlds ADD COLUMN {col_name} TEXT NOT NULL DEFAULT '{{}}'"
+                        )
+
+    def _ensure_world_binding_profile_columns(self) -> None:
+        if "world_runtime_bindings" not in self._all_tables():
+            return
+        columns = self._table_columns("world_runtime_bindings")
+        for name in ("profile_id", "profile_type"):
+            if name not in columns:
+                self.conn.execute(f"ALTER TABLE world_runtime_bindings ADD COLUMN {name} TEXT")
+
+    def _ensure_profile_enrichment_columns(self) -> None:
+        if "profile_enrichment_jobs" not in self._all_tables():
+            return
+        columns = self._table_columns("profile_enrichment_jobs")
+        additions = {
+            "enrichment_input_mode": "TEXT NOT NULL DEFAULT 'local_materials'",
+            "research_focus": "TEXT",
+            "parent_job_id": "TEXT",
+            "base_persona_version": "INTEGER",
+            "input_material_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+            "input_material_count": "INTEGER NOT NULL DEFAULT 0",
+            "new_source_ids_json": "TEXT NOT NULL DEFAULT '[]'",
+            "failure_json": "TEXT",
+            "agent_call_audits_json": "TEXT NOT NULL DEFAULT '[]'",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                with contextlib.suppress(Exception):
+                    self.conn.execute(
+                        f"ALTER TABLE profile_enrichment_jobs ADD COLUMN {name} {definition}"
+                    )
+
+    def _ensure_job_center_columns(self) -> None:
+        """Add task-center lifecycle fields without deleting historical jobs."""
+
+        tables = self._all_tables()
+        if "persona_creation_jobs" in tables:
+            columns = self._table_columns("persona_creation_jobs")
+            additions = {
+                "visibility": "TEXT NOT NULL DEFAULT 'user'",
+                "dismissed_at": "TEXT",
+                "superseded_by": "TEXT",
+                "worker_state": "TEXT NOT NULL DEFAULT 'starting'",
+                "worker_started_at": "TEXT",
+                "worker_heartbeat_at": "TEXT",
+                "worker_finished_at": "TEXT",
+                "agent_call_count": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for name, definition in additions.items():
+                if name not in columns:
+                    self.conn.execute(
+                        f"ALTER TABLE persona_creation_jobs ADD COLUMN {name} {definition}"
+                    )
+            self.conn.execute(
+                "UPDATE persona_creation_jobs SET worker_state = 'running' "
+                "WHERE worker_state = 'starting' AND status IN "
+                "('planning', 'researching', 'ingesting_sources', 'extracting', 'compiling')"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_persona_creation_jobs_task_center "
+                "ON persona_creation_jobs(visibility, dismissed_at, status, updated_at)"
+            )
+
+        if "profile_enrichment_jobs" in tables:
+            columns = self._table_columns("profile_enrichment_jobs")
+            additions = {
+                "visibility": "TEXT NOT NULL DEFAULT 'user'",
+                "dismissed_at": "TEXT",
+                "superseded_by": "TEXT",
+                "worker_state": "TEXT NOT NULL DEFAULT 'starting'",
+                "worker_started_at": "TEXT",
+                "worker_heartbeat_at": "TEXT",
+                "worker_finished_at": "TEXT",
+                "agent_call_count": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for name, definition in additions.items():
+                if name not in columns:
+                    self.conn.execute(
+                        f"ALTER TABLE profile_enrichment_jobs ADD COLUMN {name} {definition}"
+                    )
+            self.conn.execute(
+                "UPDATE profile_enrichment_jobs SET worker_state = 'running' "
+                "WHERE worker_state = 'starting' AND status IN "
+                "('researching', 'ingesting', 'compiling')"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_profile_enrichment_jobs_task_center "
+                "ON profile_enrichment_jobs(visibility, dismissed_at, status, updated_at)"
+            )
+
+        # Historical Profile Enrichment children are internal even if their
+        # old row predates the visibility column.  The explicit FK reference
+        # is the authoritative detection signal; parent_job_id is checked as
+        # an additional guard against unrelated Persona jobs.
+        if {"persona_creation_jobs", "profile_enrichment_jobs"} <= tables:
+            rows = self.conn.execute(
+                """
+                SELECT pc.id, pc.job_config_json
+                FROM persona_creation_jobs pc
+                JOIN profile_enrichment_jobs pe
+                  ON pe.persona_creation_job_id = pc.id
+                WHERE pe.persona_creation_job_id IS NOT NULL
+                """
+            ).fetchall()
+            for row in rows:
+                try:
+                    config = json.loads(row["job_config_json"] or "{}")
+                except (TypeError, ValueError):
+                    config = {}
+                if config.get("parent_job_id") or config.get("parent_profile_enrichment_job_id"):
+                    self.conn.execute(
+                        "UPDATE persona_creation_jobs SET visibility = 'internal' WHERE id = ?",
+                        (str(row["id"]),),
+                    )
+
+    def _ensure_identity_spec_v2_columns(self) -> None:
+        """Add V2 identity and research strategy columns to persona_creation_jobs."""
+        if "persona_creation_jobs" not in self._all_tables():
+            return
+        columns = self._table_columns("persona_creation_jobs")
+        additions = {
+            "subject_kind": "TEXT NOT NULL DEFAULT 'real_person'",
+            "work_or_universe": "TEXT",
+            "life_status": "TEXT NOT NULL DEFAULT 'unknown'",
+            "privacy_scope": "TEXT NOT NULL DEFAULT 'public'",
+            "identity_context": "TEXT",
+            "user_defined_facts": "TEXT",
+            "research_mode": "TEXT NOT NULL DEFAULT 'auto'",
+            "web_scope": "TEXT",
+            "research_instructions": "TEXT",
+            "resolved_identity_json": "TEXT NOT NULL DEFAULT '{}'",
+        }
+        for name, col_def in additions.items():
+            if name not in columns:
+                with contextlib.suppress(Exception):
+                    self.conn.execute(
+                        f"ALTER TABLE persona_creation_jobs ADD COLUMN {name} {col_def};"
+                    )
+
+    def _ensure_research_capability_cache_columns(self) -> None:
+        """Add TTL/fingerprint fields without invalidating existing probes."""
+
+        if "research_capability_cache" not in self._all_tables():
+            return
+        columns = self._table_columns("research_capability_cache")
+        additions = {
+            "configuration_fingerprint": "TEXT NOT NULL DEFAULT ''",
+            "expires_at": "TEXT",
+            "cache_ttl_seconds": "REAL",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                self.conn.execute(
+                    f"ALTER TABLE research_capability_cache ADD COLUMN {name} {definition}"
+                )
+
+    def _all_tables(self) -> set[str]:
+        return {
+            str(row["name"])
+            for row in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+
+    def _ensure_persona_research_quality_columns(self) -> None:
+        """Backfill adaptive research columns for databases created pre-upgrade."""
+        if "persona_creation_jobs" not in self._all_tables():
+            return
+        info = self.conn.execute("PRAGMA table_info(persona_creation_jobs)").fetchall()
+        columns = {str(row["name"]) for row in info}
+        additions = {
+            "life_stage_progress_json": "TEXT NOT NULL DEFAULT '{}'",
+            "life_stages_json": "TEXT NOT NULL DEFAULT '[]'",
+            "information_gain_json": "TEXT NOT NULL DEFAULT '[]'",
+            "research_gaps_json": "TEXT NOT NULL DEFAULT '[]'",
+            "research_checkpoints_json": "TEXT NOT NULL DEFAULT '[]'",
+            "research_stop_reason": "TEXT",
+            "query_history_json": "TEXT NOT NULL DEFAULT '{}'",
+            "private_coverage_json": "TEXT NOT NULL DEFAULT '{}'",
+            "progress_json": "TEXT NOT NULL DEFAULT '{}'",
+            "failure_json": "TEXT",
+            "agent_call_audits_json": "TEXT NOT NULL DEFAULT '[]'",
+            "checkpoints_json": "TEXT NOT NULL DEFAULT '[]'",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                self.conn.execute(
+                    f"ALTER TABLE persona_creation_jobs ADD COLUMN {name} {definition}"
+                )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS persona_research_checkpoints (
+              id TEXT PRIMARY KEY,
+              job_id TEXT NOT NULL REFERENCES persona_creation_jobs(id) ON DELETE CASCADE,
+              round_index INTEGER NOT NULL,
+              raw_source_count INTEGER NOT NULL DEFAULT 0,
+              independent_source_count INTEGER NOT NULL DEFAULT 0,
+              quality_source_count INTEGER NOT NULL DEFAULT 0,
+              coverage_json TEXT NOT NULL DEFAULT '{}',
+              information_gain_json TEXT NOT NULL DEFAULT '{}',
+              gaps_json TEXT NOT NULL DEFAULT '[]',
+              stop_reason TEXT,
+              created_at TEXT NOT NULL
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS persona_source_clusters (
+              cluster_id TEXT NOT NULL,
+              persona_id TEXT NOT NULL REFERENCES personas(id) ON DELETE CASCADE,
+              origin_type TEXT NOT NULL DEFAULT 'unknown',
+              origin_identifier TEXT NOT NULL DEFAULT '',
+              member_source_ids_json TEXT NOT NULL DEFAULT '[]',
+              canonical_source_id TEXT,
+              independence_confidence REAL NOT NULL DEFAULT 0.0,
+              reason TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(persona_id, cluster_id)
+            )
+            """
+        )
+
+    def _ensure_world_tables(self) -> None:
+        if "organizations" in self._all_tables():
+            info = self.conn.execute("PRAGMA table_info(organizations)").fetchall()
+            pk_cols = [str(r["name"]) for r in info if int(r["pk"]) > 0]
+            if pk_cols == ["id"]:
+                self.conn.execute("DROP TABLE organizations")
+                self.conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS organizations (
+                      id TEXT NOT NULL,
+                      world_id TEXT NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+                      branch_id TEXT NOT NULL REFERENCES world_branches(id) ON DELETE CASCADE,
+                      name TEXT NOT NULL,
+                      leadership_json TEXT NOT NULL DEFAULT '[]',
+                      departments_json TEXT NOT NULL DEFAULT '[]',
+                      employees_count INTEGER NOT NULL DEFAULT 0,
+                      budget_billions REAL NOT NULL DEFAULT 0.0,
+                      cash_reserves_billions REAL NOT NULL DEFAULT 0.0,
+                      technology_json TEXT NOT NULL DEFAULT '[]',
+                      projects_json TEXT NOT NULL DEFAULT '[]',
+                      strategy_json TEXT NOT NULL DEFAULT '{}',
+                      culture_json TEXT NOT NULL DEFAULT '{}',
+                      updated_at TEXT NOT NULL,
+                      PRIMARY KEY(world_id, branch_id, id)
+                    )
+                    """
+                )
+        if "technologies" in self._all_tables():
+            info = self.conn.execute("PRAGMA table_info(technologies)").fetchall()
+            pk_cols = [str(r["name"]) for r in info if int(r["pk"]) > 0]
+            if pk_cols == ["id"]:
+                self.conn.execute("DROP TABLE technologies")
+                self.conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS technologies (
+                      id TEXT NOT NULL,
+                      world_id TEXT NOT NULL REFERENCES worlds(id) ON DELETE CASCADE,
+                      branch_id TEXT NOT NULL REFERENCES world_branches(id) ON DELETE CASCADE,
+                      name TEXT NOT NULL,
+                      maturity REAL NOT NULL DEFAULT 0.0,
+                      cost REAL NOT NULL DEFAULT 1.0,
+                      performance REAL NOT NULL DEFAULT 1.0,
+                      adoption REAL NOT NULL DEFAULT 0.0,
+                      dependencies_json TEXT NOT NULL DEFAULT '[]',
+                      lead_org_id TEXT,
+                      updated_at TEXT NOT NULL,
+                      PRIMARY KEY(world_id, branch_id, id)
+                    )
+                    """
+                )
+
+    def _ensure_runtime_branch_columns(self) -> None:
+        self._ensure_affect_branch_column()
+        self._ensure_needs_branch_column()
+        self._ensure_relationships_branch_column()
+        self._ensure_change_events_branch_column()
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS change_event_supports (
+              event_id TEXT NOT NULL REFERENCES change_events(id) ON DELETE CASCADE,
+              session_id TEXT NOT NULL,
+              turn_id TEXT NOT NULL,
+              support_weight REAL NOT NULL DEFAULT 1.0,
+              PRIMARY KEY(event_id, session_id, turn_id)
+            )
+            """
+        )
+
+    def _table_columns(self, table: str) -> set[str]:
+        return {
+            str(row["name"]) for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+
+    def _ensure_affect_branch_column(self) -> None:
+        if "branch_id" in self._table_columns("affect_states"):
+            return
+        self.conn.execute("ALTER TABLE affect_states RENAME TO affect_states_legacy_rc5")
+        self.conn.execute(
+            """
+            CREATE TABLE affect_states (
+              persona_id TEXT NOT NULL,
+              branch_id TEXT NOT NULL DEFAULT 'main',
+              name TEXT NOT NULL,
+              kind TEXT NOT NULL,
+              intensity REAL NOT NULL,
+              baseline REAL NOT NULL,
+              decay_rate REAL NOT NULL,
+              updated_at TEXT NOT NULL,
+              triggers_json TEXT NOT NULL,
+              confidence REAL NOT NULL,
+              PRIMARY KEY(persona_id, branch_id, name, kind)
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO affect_states (
+              persona_id, branch_id, name, kind, intensity, baseline, decay_rate,
+              updated_at, triggers_json, confidence
+            )
+            SELECT persona_id, 'main', name, kind, intensity, baseline, decay_rate,
+                   updated_at, triggers_json, confidence
+            FROM affect_states_legacy_rc5
+            """
+        )
+        self.conn.execute("DROP TABLE affect_states_legacy_rc5")
+
+    def _ensure_needs_branch_column(self) -> None:
+        if "branch_id" in self._table_columns("needs"):
+            return
+        self.conn.execute("ALTER TABLE needs RENAME TO needs_legacy_rc5")
+        self.conn.execute(
+            """
+            CREATE TABLE needs (
+              persona_id TEXT NOT NULL,
+              branch_id TEXT NOT NULL DEFAULT 'main',
+              name TEXT NOT NULL,
+              level REAL NOT NULL,
+              baseline REAL NOT NULL,
+              updated_at TEXT NOT NULL,
+              confidence REAL NOT NULL,
+              reasons_json TEXT NOT NULL,
+              PRIMARY KEY(persona_id, branch_id, name)
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO needs (
+              persona_id, branch_id, name, level, baseline, updated_at, confidence,
+              reasons_json
+            )
+            SELECT persona_id, 'main', name, level, baseline, updated_at, confidence,
+                   reasons_json
+            FROM needs_legacy_rc5
+            """
+        )
+        self.conn.execute("DROP TABLE needs_legacy_rc5")
+
+    def _ensure_relationships_branch_column(self) -> None:
+        if "branch_id" in self._table_columns("relationships"):
+            return
+        self.conn.execute("ALTER TABLE relationships RENAME TO relationships_legacy_rc5")
+        self.conn.execute(
+            """
+            CREATE TABLE relationships (
+              persona_id TEXT NOT NULL,
+              branch_id TEXT NOT NULL DEFAULT 'main',
+              counterpart TEXT NOT NULL,
+              state_json TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY(persona_id, branch_id, counterpart)
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO relationships (
+              persona_id, branch_id, counterpart, state_json, updated_at
+            )
+            SELECT persona_id, 'main', counterpart, state_json, updated_at
+            FROM relationships_legacy_rc5
+            """
+        )
+        self.conn.execute("DROP TABLE relationships_legacy_rc5")
+
+    def _ensure_change_events_branch_column(self) -> None:
+        if "branch_id" in self._table_columns("change_events"):
+            return
+        self.conn.execute("ALTER TABLE change_events RENAME TO change_events_legacy_rc5")
+        self.conn.execute(
+            """
+            CREATE TABLE change_events (
+              id TEXT PRIMARY KEY,
+              persona_id TEXT NOT NULL REFERENCES personas(id) ON DELETE CASCADE,
+              branch_id TEXT NOT NULL DEFAULT 'main',
+              event_type TEXT NOT NULL,
+              target_type TEXT NOT NULL,
+              target_id TEXT NOT NULL,
+              session_id TEXT,
+              turn_id TEXT,
+              data_json TEXT NOT NULL,
+              created_at TEXT NOT NULL
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT INTO change_events (
+              id, persona_id, branch_id, event_type, target_type, target_id,
+              session_id, turn_id, data_json, created_at
+            )
+            SELECT id, persona_id, 'main', event_type, target_type, target_id,
+                   session_id, turn_id, data_json, created_at
+            FROM change_events_legacy_rc5
+            """
+        )
+        self.conn.execute("DROP TABLE change_events_legacy_rc5")
+
+    def _ensure_research_artifact_columns(self) -> None:
+        columns = self._table_columns("research_artifacts")
+        if "artifact_canonical_sha256" not in columns:
+            self.conn.execute(
+                "ALTER TABLE research_artifacts ADD COLUMN artifact_canonical_sha256 TEXT"
+            )
+        indexes = {
+            str(row["name"])
+            for row in self.conn.execute("PRAGMA index_list(research_artifacts)").fetchall()
+        }
+        if "idx_research_artifacts_canonical_unique" not in indexes:
+            self.conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_research_artifacts_canonical_unique
+                ON research_artifacts(persona_id, task_id, artifact_canonical_sha256)
+                WHERE artifact_canonical_sha256 IS NOT NULL
+                """
+            )
+
+    def has_fts5(self) -> bool:
+        try:
+            probe = sqlite3.connect(":memory:")
+            probe.execute("CREATE VIRTUAL TABLE fts5_probe USING fts5(x)")
+            probe.close()
+            return True
+        except sqlite3.OperationalError:
+            return False
+
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Group writes into one SQLite transaction (nested calls join).
+
+        Repository ``save_*`` helpers commit individually.  Callers that need
+        all-or-nothing semantics for a logical unit of work (one World tick)
+        wrap them in this context: writes within the block share one
+        connection, so uncommitted state stays visible, and any failure rolls
+        the whole unit back instead of leaving a partial tick behind.
+        """
+        conn = self.conn
+        if conn.in_transaction:
+            yield
+            return
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield
+        except BaseException:
+            with contextlib.suppress(Exception):
+                conn.rollback()
+            raise
+        else:
+            conn.commit()
+
+    def table_exists(self, name: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+        ).fetchone()
+        return row is not None
+
+    def reader(self) -> sqlite3.Connection:
+        """A read-only connection private to the calling thread.
+
+        For read paths that run on worker threads and must never write; they
+        see every committed write and never hold a write lock.
+        """
+
+        return self._thread_connection("reader")
+
+    def close(self) -> None:
+        with self._threads_lock:
+            for connection in self._thread_connections:
+                with contextlib.suppress(Exception):
+                    connection.close()
+            self._thread_connections.clear()
+        self._local = threading.local()
+        if self._conn is not None:
+            self._conn.close()
+            self._conn = None
+        self._owner_thread = None
+
+    def __enter__(self) -> Database:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()

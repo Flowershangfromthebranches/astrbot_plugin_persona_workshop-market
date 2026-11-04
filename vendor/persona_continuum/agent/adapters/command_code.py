@@ -1,0 +1,578 @@
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import re
+import time
+from collections.abc import AsyncIterator
+from typing import Any
+
+from persona_continuum.agent.adapter import (
+    AgentAdapter,
+    AgentSession,
+    build_runtime_binding_snapshot,
+    resolve_binary,
+    safe_exec_cmd,
+)
+from persona_continuum.agent.context_capability import ContextWindowMode
+from persona_continuum.agent.context_fields import ContextScope, extract_context_window
+from persona_continuum.agent.models import (
+    AgentAttachment,
+    AgentCapabilityFlags,
+    AgentEvent,
+    AgentEventType,
+    AgentProbeResult,
+    AgentSessionConfig,
+    AgentStatus,
+    AgentTurn,
+    MediaInputMode,
+    ModelCapability,
+    OutputStreamingMode,
+    PromptMode,
+    RuntimeBindingSnapshot,
+    SelectionStrategy,
+    StructuredOutputMode,
+)
+from persona_continuum.agent.prompt import AgentPromptRenderer
+from persona_continuum.agent.response_collector import agent_error_event, sanitize_diagnostic
+from persona_continuum.agent.subprocess_transport import SubprocessAgentTransport
+from persona_continuum.auth.credentials import CredentialManager, build_runtime_environment
+from persona_continuum.numeric import safe_int
+
+
+class CommandCodeAdapter(AgentAdapter):
+    adapter_id = "command_code"
+    name = "Command Code"
+    # The headless invocation below is `command-code -p <prompt>`: the prompt
+    # travels as a single argv element, so the transport diagnostics must say
+    # argv.  (stdin is opened but immediately closed; nothing is written.)
+    prompt_transport_mode = "argv"
+    context_window_mode = ContextWindowMode.DISCOVERABLE
+    context_scope = ContextScope.PER_REQUEST
+    adapter_session_mode = "per_request"
+    parallel_turns_same_session = False
+    parallel_independent_sessions = True
+    max_parallel_independent_sessions = 4
+    upstream_context_is_native_only = True
+    model_discovery_timeout_seconds = 10.0
+    probe_timeout_seconds = 22.0
+
+    def __init__(self) -> None:
+        self.binary_candidates = [
+            "command-code",
+            "cmd",
+            "commandcode",
+            "cmdc",
+            "~/.npm-global/bin/command-code",
+            "~/.npm-global/bin/cmd",
+            "~/.local/bin/command-code",
+            "~/.local/bin/cmd",
+            "/opt/homebrew/bin/command-code",
+            "/opt/homebrew/bin/cmd",
+            "/usr/local/bin/command-code",
+            "/usr/local/bin/cmd",
+        ]
+        self._resolved_binary: str | None = None
+        self.credential_manager: CredentialManager | None = None
+        self.prompt_mode = PromptMode.INLINE_SYSTEM
+        self.structured_output_mode = StructuredOutputMode.PROMPT_ONLY
+        self.output_streaming_mode = OutputStreamingMode.BUFFERED_FINAL
+        self.protocols = ["plain_cli", "streaming_json_cli"]
+        self._models_cache: tuple[str, float, list[ModelCapability]] | None = None
+        self._model_discovery_error = ""
+
+    def invalidate_model_cache(self) -> None:
+        self._models_cache = None
+
+    async def probe(self) -> AgentProbeResult:
+        binary = self._find_binary()
+        if not binary:
+            return AgentProbeResult(
+                id=self.adapter_id,
+                name=self.name,
+                status=AgentStatus.DISABLED,
+                binary_path=None,
+                version=None,
+                protocols=["plain_cli", "streaming_json_cli"],
+                capabilities=AgentCapabilityFlags(
+                    streaming=False,
+                    persistent_session=False,
+                    model_discovery=True,
+                    model_selection=SelectionStrategy.STARTUP,
+                    reasoning_discovery=True,
+                    reasoning_selection=SelectionStrategy.STARTUP,
+                    mcp=True,
+                    structured_output_mode=self.structured_output_mode,
+                ),
+                models=[],
+                status_detail="Command Code CLI binary not found on system",
+            )
+
+        metadata_env = build_runtime_environment(
+            credential_manager=self.credential_manager, overrides={"DO_NOT_TRACK": "1"}
+        )
+        code, out, _ = await safe_exec_cmd(
+            [binary, "--version"], timeout=5.0, env=metadata_env
+        )
+        version_str = out.strip().split("\n")[0] if code == 0 and out else "detected"
+        if code != 0:
+            return AgentProbeResult(
+                id=self.adapter_id, name=self.name, status=AgentStatus.BROKEN,
+                binary_path=binary, models=[], status_detail="CLI version probe failed",
+            )
+
+        # Check authentication status via command-code status
+        status_code, status_out, _ = await safe_exec_cmd(
+            [binary, "status", "--json"], timeout=6.0, env=metadata_env
+        )
+        status_facts = self._parse_status_json(status_out) if status_code == 0 else {}
+        is_auth = bool(status_facts.get("authenticated")) or (
+            status_code == 0
+            and (
+                "authentication verified" in status_out.lower()
+                or "authenticated as" in status_out.lower()
+                or '"authenticated":true' in status_out.lower().replace(" ", "")
+            )
+        )
+
+        status = AgentStatus.READY if is_auth else AgentStatus.AUTH_REQUIRED
+        models = await self.list_models()
+        active_model = str(status_facts.get("model") or "")
+        active_window = safe_int(status_facts.get("context_window"), default=None, minimum=1)
+        if active_model and active_window is not None:
+            for model in models:
+                if model.id == active_model:
+                    model.context_window = active_window
+                    model.source = "dynamic"
+                    break
+            else:
+                models.insert(
+                    0,
+                    ModelCapability(
+                        id=active_model,
+                        display_name=active_model,
+                        provider=str(status_facts.get("provider") or "command_code"),
+                        context_window=active_window,
+                        source="dynamic",
+                        reasoning_selection=SelectionStrategy.STARTUP,
+                    ),
+                )
+
+        return AgentProbeResult(
+            id=self.adapter_id,
+            name=self.name,
+            status=status,
+            binary_path=binary,
+            version=version_str,
+            auth_status="configured" if is_auth else "auth_required",
+            protocols=["plain_cli", "streaming_json_cli"],
+            capabilities=AgentCapabilityFlags(
+                streaming=False,
+                persistent_session=False,
+                model_discovery=True,
+                model_selection=SelectionStrategy.STARTUP,
+                reasoning_discovery=True,
+                reasoning_selection=SelectionStrategy.STARTUP,
+                mcp=True,
+                structured_output_mode=self.structured_output_mode,
+            ),
+            models=models,
+            model_discovery_error=self._model_discovery_error or None,
+            status_detail=(
+                "Command Code CLI authenticated and ready"
+                + (f"; model discovery failed: {self._model_discovery_error}"
+                   if self._model_discovery_error else "")
+                if is_auth
+                else "Command Code auth required (run `command-code login`)"
+            ),
+        )
+
+    async def list_models(self) -> list[ModelCapability]:
+        from persona_continuum.performance.capability_cache import capability_cache_key
+
+        binary = self._find_binary()
+        if binary:
+            identity = capability_cache_key(self)[1]
+            cached = self._models_cache
+            if cached and cached[0] == identity and time.monotonic() - cached[1] < 300:
+                return [model.model_copy(deep=True) for model in cached[2]]
+            code, out, err = await safe_exec_cmd(
+                [binary, "--list-models"], timeout=self.model_discovery_timeout_seconds,
+                # Metadata can finish while CLI telemetry keeps the process alive.
+                env=build_runtime_environment(
+                    credential_manager=self.credential_manager, overrides={"DO_NOT_TRACK": "1"}
+                ),
+            )
+            if code == 0 and out:
+                parsed = self._parse_models(out)
+                if parsed:
+                    self._model_discovery_error = ""
+                    self._models_cache = (identity, time.monotonic(), parsed)
+                    return parsed
+            self._model_discovery_error = sanitize_diagnostic(
+                err or "CLI returned no usable model catalog", limit=250
+            )
+        return []
+
+    def _parse_models(self, text: str) -> list[ModelCapability]:
+        lines = text.splitlines()
+        models: list[ModelCapability] = []
+        current_section = ""
+
+        skip_prefixes = (
+            "available models",
+            "pass the full id",
+            "cmd --model",
+            "command-code --model",
+            "docs:",
+            "note:",
+            "tip:",
+            "error:",
+            "warning:",
+        )
+
+        for line in lines:
+            line_s = line.strip()
+            if not line_s or any(line_s.lower().startswith(p) for p in skip_prefixes):
+                continue
+
+            # Section headers like 'Open Source', 'Stealth', 'Anthropic', 'OpenAI',
+            # 'Google', 'Sakana', 'Meta', 'xAI'
+            if (
+                not line.startswith(" ")
+                and not line.startswith("\t")
+                and "/" not in line_s
+                and not line_s.startswith("claude-")
+                and not line_s.startswith("gpt-")
+            ):
+                current_section = line_s
+                continue
+
+            parts = line_s.split(None, 1)
+            if parts:
+                model_id = parts[0]
+                desc = parts[1] if len(parts) > 1 else model_id
+
+                # Determine provider
+                if "/" in model_id:
+                    provider = model_id.split("/")[0]
+                elif model_id.startswith("claude-"):
+                    provider = "anthropic"
+                elif model_id.startswith("gpt-"):
+                    provider = "openai"
+                elif current_section:
+                    provider = current_section.lower().replace(" ", "_")
+                else:
+                    provider = "command_code"
+
+                # Check reasoning capabilities
+                has_reasoning = any(
+                    k in desc.lower() or k in model_id.lower()
+                    for k in (
+                        "reasoning",
+                        "thinking",
+                        "r1",
+                        "sol",
+                        "terra",
+                        "opus",
+                        "sonnet",
+                        "k3",
+                        "glm-5",
+                    )
+                )
+                # Command Code's --effort contract exposes low, medium and
+                # high. "none" means omit the flag and use the model default.
+                model_lower = model_id.lower()
+                if "glm-5.3-flash" in model_lower:
+                    supported_efforts = ["none", "low", "high", "max"]
+                    default_effort = "high"
+                elif "deepseek-v4-pro" in model_lower:
+                    supported_efforts = ["none", "high", "max"]
+                    default_effort = "high"
+                else:
+                    supported_efforts = ["none", "low", "medium", "high"]
+                    default_effort = "medium" if has_reasoning else "none"
+
+                window = extract_context_window({"text": desc}) or self._parse_context_phrase(
+                    desc
+                )
+                models.append(
+                    ModelCapability(
+                        id=model_id,
+                        display_name=f"{model_id} ({desc})" if desc != model_id else model_id,
+                        provider=provider,
+                        supported_reasoning_efforts=supported_efforts,
+                        default_reasoning_effort=default_effort,
+                        context_window=window,
+                        # The CLI exposes --effort and this adapter binds it
+                        # directly in build_exec_argv.
+                        source="official_cli",
+                        reasoning_selection=SelectionStrategy.STARTUP,
+                    )
+                )
+
+        return models
+
+    @staticmethod
+    def _parse_status_json(text: str) -> dict[str, Any]:
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _parse_context_phrase(text: str) -> int | None:
+        match = re.search(r"(\d+(?:\.\d+)?)\s*[Mm]\s*context", text or "", re.I)
+        if match:
+            return int(float(match.group(1)) * 1_000_000)
+        match = re.search(r"(\d+)\s*[Kk]\s*context", text or "", re.I)
+        if match:
+            return int(match.group(1)) * 1_000
+        return extract_context_window({"description": text})
+
+    def _fallback_models(self) -> list[ModelCapability]:
+        known_models = [
+            ("deepseek/deepseek-v4-flash", "fast hybrid-attention reasoning", "deepseek"),
+            ("deepseek/deepseek-v4-pro", "hybrid-attention long-context reasoning", "deepseek"),
+            (
+                "moonshotai/kimi-k3",
+                "long-horizon coding & knowledge work with 1M context",
+                "moonshotai",
+            ),
+            ("moonshotai/kimi-k2.7-code", "improved long-horizon coding with vision", "moonshotai"),
+            ("zai-org/glm-5.3", "frontier coding with emergent cyber capabilities", "zai-org"),
+            (
+                "zai-org/glm-5.2",
+                "powerful coding with 1M context and long-horizon tasks",
+                "zai-org",
+            ),
+            ("minimaxai/minimax-m3", "frontier coding, agents & native multimodality", "minimaxai"),
+            ("qwen/qwen3.8-max", "autonomous long-horizon coding & professional work", "qwen"),
+            ("qwen/qwen3.7-max", "frontier coding & long-horizon agent execution", "qwen"),
+            ("claude-sonnet-5", "best combo of speed & intelligence", "anthropic"),
+            ("claude-opus-5", "most intelligent Opus for agents and coding", "anthropic"),
+            ("claude-haiku-4-5", "fastest & most compact", "anthropic"),
+            ("gpt-5.6-sol", "frontier model for complex professional work", "openai"),
+            ("gpt-5.6-terra", "balances intelligence and cost", "openai"),
+            ("gpt-5.6-luna", "optimized for cost-sensitive workloads", "openai"),
+            ("gpt-5.4", "frontier model for general complex work", "openai"),
+            ("google/gemini-3.7-flash", "higher-quality coding & agentic workflows", "google"),
+            ("google/gemini-3.5-flash", "Pro-level coding proficiency", "google"),
+            ("xai/grok-4.6", "frontier performance on coding and knowledge work", "xai"),
+            ("xai/grok-4.5", "smartest model for coding, agentic tasks", "xai"),
+        ]
+        return [
+            ModelCapability(
+                id=m_id,
+                display_name=f"{m_id} ({desc})",
+                provider=prov,
+                supported_reasoning_efforts=["none", "low", "medium", "high"],
+                default_reasoning_effort="medium",
+                source="config",
+                reasoning_selection=SelectionStrategy.STARTUP,
+            )
+            for m_id, desc, prov in known_models
+        ]
+
+    def build_exec_argv(
+        self,
+        binary: str,
+        config: AgentSessionConfig,
+        prompt: str,
+    ) -> list[str]:
+        cmd = [binary, "-p", prompt, "--yolo", "--output-format", "text"]
+        if config.model_id:
+            cmd.extend(["-m", config.model_id])
+        effort = (config.reasoning_effort or "").strip().lower()
+        if effort and effort not in {"none", "default", "auto"}:
+            model_id = (config.model_id or "").lower()
+            if ("glm-5.3-flash" in model_id and effort == "medium") or (
+                "deepseek-v4-pro" in model_id and effort in {"low", "medium"}
+            ):
+                effort = "high"
+            cmd.extend(["--effort", effort])
+        return cmd
+
+    async def create_session(self, config: AgentSessionConfig) -> AgentSession:
+        binary = self._find_binary()
+        if not binary:
+            raise RuntimeError(f"Cannot start session: binary for {self.name} not found")
+
+        session = AgentSession(
+            config=config,
+            is_active=True,
+            session_data={
+                "binary": binary,
+                "active_proc": None,
+                "protocol": "plain_cli",
+                "effective_model": config.model_id,
+                "effective_reasoning": config.reasoning_effort,
+            },
+        )
+        session._cancel_event = asyncio.Event()
+        return session
+
+    async def bind_runtime(self, session: AgentSession) -> RuntimeBindingSnapshot:
+        return build_runtime_binding_snapshot(
+            self,
+            session,
+            protocol="plain_cli",
+            model_verified=True,
+            reasoning_verified=True,
+            verification_method="cli_invocation_flags",
+        )
+
+    def _attachment_prompt_block(self, turn: AgentTurn) -> str:
+        """Wire-text reference block for this turn's attachments.
+
+        Verified against the installed CLI (v1.49.0): headless `-p` reads a
+        plain filesystem path in the prompt and returns real vision content
+        (`@path` form also works, but the plain path is the stable carrier).
+        Only short path references travel here -- never file bytes.
+        """
+
+        from persona_continuum.agent.media_transport import (
+            describe_unconsumed_attachment,
+            require_consumable_or_raise,
+        )
+
+        attachments = [
+            AgentAttachment.model_validate(a) if isinstance(a, dict) else a
+            for a in (turn.attachments or [])
+            if isinstance(a, (dict, AgentAttachment))
+        ]
+        if not attachments:
+            return ""
+        lines = ["用户本轮上传了以下附件："]
+        for attachment in attachments:
+            mode = MediaInputMode.LOCAL_PATH.value
+            if attachment.kind not in {"image", "video", "audio", "file"}:
+                mode = MediaInputMode.UNSUPPORTED.value
+            if mode == MediaInputMode.LOCAL_PATH.value:
+                lines.append(
+                    f"- {attachment.kind} {attachment.filename}：{attachment.local_path} "
+                    "请读取该文件并将文件内容作为本轮用户输入的一部分，"
+                    "结合房间上下文完成回答。"
+                )
+            else:
+                require_consumable_or_raise(
+                    attachment, mode, adapter_id=self.adapter_id
+                )
+                lines.append(describe_unconsumed_attachment(attachment, mode))
+        return "\n".join(lines)
+
+    async def send(self, session: AgentSession, turn: AgentTurn) -> AsyncIterator[AgentEvent]:
+        binary = session.session_data.get("binary") or self._find_binary() or "command-code"
+        prompt = AgentPromptRenderer.render_for_single_prompt(turn)
+        media_block = self._attachment_prompt_block(turn)
+        if media_block:
+            prompt = f"{prompt}\n\n{media_block}"
+        cmd = self.build_exec_argv(binary, session.config, prompt)
+
+        env = build_runtime_environment(
+            credential_manager=self.credential_manager,
+            credential_id=session.config.auth_profile_id,
+            auth_env_var=session.config.auth_env_var,
+        )
+
+        transport: SubprocessAgentTransport | None = None
+        try:
+            transport = await SubprocessAgentTransport.spawn(
+                session,
+                cmd,
+                stdin=True,
+                env=env,
+                cwd=session.config.working_dir,
+            )
+            transport.close_stdin()
+
+            full_content: list[str] = []
+            while True:
+                if session._cancel_event and session._cancel_event.is_set():
+                    await transport.kill()
+                    yield AgentEvent(
+                        type=AgentEventType.DONE,
+                        content="".join(full_content),
+                        metadata={"cancelled": True},
+                    )
+                    return
+
+                chunk = await transport.read(4096)
+                if not chunk:
+                    break
+
+                text = chunk.decode("utf-8", errors="replace")
+                if text:
+                    full_content.append(text)
+
+            returncode = await transport.wait()
+            diagnostics = {
+                "returncode": returncode,
+                "stderr_tail": transport.stderr_tail,
+                "cli_failure": transport.stderr_tail,
+                "output_streaming_mode": self.output_streaming_mode.value,
+            }
+            if returncode and not full_content:
+                err_msg = (
+                    transport.stderr_tail.strip()
+                    if transport.stderr_tail and transport.stderr_tail.strip()
+                    else "AGENT_PROCESS_EXITED_WITHOUT_OUTPUT"
+                )
+                yield AgentEvent(
+                    type=AgentEventType.ERROR,
+                    error=err_msg,
+                    metadata={
+                        "failure_code": err_msg,
+                        **diagnostics,
+                    },
+                )
+                return
+            if full_content:
+                yield AgentEvent(
+                    type=AgentEventType.CHUNK,
+                    content="".join(full_content),
+                    metadata={"stream_mode": "buffered_final"},
+                )
+            else:
+                yield AgentEvent(
+                    type=AgentEventType.ERROR,
+                    error="AGENT_PROCESS_EXITED_WITHOUT_OUTPUT",
+                    metadata={
+                        "failure_code": "AGENT_PROCESS_EXITED_WITHOUT_OUTPUT",
+                        **diagnostics,
+                    },
+                )
+                return
+            yield AgentEvent(
+                type=AgentEventType.DONE,
+                content="".join(full_content),
+                metadata=diagnostics,
+            )
+
+        except Exception as exc:
+            yield agent_error_event(exc, protocol="plain_cli")
+        finally:
+            if transport is not None:
+                await transport.close(force=transport.process_alive)
+
+    async def cancel(self, session: AgentSession) -> None:
+        session.request_cancel()
+        proc: asyncio.subprocess.Process | None = session.session_data.get("active_proc")
+        if proc and proc.returncode is None:
+            try:
+                proc.terminate()
+            except Exception:
+                with contextlib.suppress(Exception):
+                    proc.kill()
+
+    async def close(self, session: AgentSession) -> None:
+        session.mark_closed()
+        await self.cancel(session)
+
+    def _find_binary(self) -> str | None:
+        if self._resolved_binary:
+            return self._resolved_binary
+        self._resolved_binary = resolve_binary(self.binary_candidates)
+        return self._resolved_binary

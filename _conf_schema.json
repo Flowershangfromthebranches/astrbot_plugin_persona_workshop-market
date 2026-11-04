@@ -1,0 +1,47 @@
+{
+  "native_prefix": {
+    "description": "写入 AstrBot 原生人格时使用的名称前缀",
+    "type": "string",
+    "default": "人格工坊·"
+  },
+  "max_source_chars": {
+    "description": "角色资料最多读取多少字，超出部分截断",
+    "type": "int",
+    "default": 30000
+  },
+  "room_runtime_enabled": {
+    "description": "启用 Room 动态人格运行时；关闭后只使用静态人格提示词",
+    "type": "bool",
+    "default": true
+  },
+  "memory_mode": {
+    "description": "长期记忆后端：auto（LivingMemory 优先，否则 continuum）、continuum、livingmemory、hybrid",
+    "type": "string",
+    "default": "auto"
+  },
+  "livingmemory_top_k": {
+    "description": "Room 运行时从 LivingMemory 读取的记忆条数（仅注入模式使用）",
+    "type": "int",
+    "default": 5
+  },
+  "livingmemory_inject": {
+    "description": "是否把 LivingMemory 检索结果由本插件注入；LivingMemory 自己的召回 hook 已注入时建议关闭",
+    "type": "bool",
+    "default": false
+  },
+  "consultation_mode": {
+    "description": "静默多专家会诊：off 关闭；complex 复杂消息触发；always 每轮触发",
+    "type": "string",
+    "default": "off"
+  },
+  "consultation_min_chars": {
+    "description": "complex 模式下触发会诊的用户消息最小长度",
+    "type": "int",
+    "default": 120
+  },
+  "consultation_provider_id": {
+    "description": "会诊使用的模型 Provider ID；留空使用 AstrBot 当前模型",
+    "type": "string",
+    "default": ""
+  }
+}

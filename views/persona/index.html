@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>人格工坊</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>人格工坊</h1>
+      <p class="muted">完整的人格制作链路：资料/研究 → 八维证据 → 访谈/审阅 → 编译 → 启用。使用 AstrBot 已配置的模型。</p>
+    </div>
+    <div id="activeBadge" class="badge">当前人格：读取中…</div>
+  </header>
+
+  <nav class="tabs" aria-label="人格工坊页面">
+    <button class="tab active" data-tab="create" type="button">完整制作</button>
+    <button class="tab" data-tab="tasks" type="button">任务中心 <span id="jobCount" class="count"></span></button>
+    <button class="tab" data-tab="library" type="button">人格库 <span id="personaCount" class="count"></span></button>
+  </nav>
+
+  <main>
+    <section id="tab-create" class="tab-panel">
+      <div class="grid">
+        <div class="card form-card">
+          <div class="card-head">
+            <div>
+              <h2>创建人格</h2>
+              <p class="muted small">所有输出都会进入 Evidence → ResearchArtifact → 八维 Compilation 正式链路。</p>
+            </div>
+          </div>
+
+          <h3 class="section-title">基本身份</h3>
+          <div class="row">
+            <label>名称 *
+              <input id="pcName" maxlength="120" placeholder="例如：角色名 / Steve Jobs">
+            </label>
+            <label>别名（逗号分隔）
+              <input id="pcAliases" placeholder="例如：Luke Pearce">
+            </label>
+          </div>
+          <div class="row">
+            <label>人物来源 *
+              <select id="pcSubjectKind">
+                <option value="fictional_character">已有作品角色（游戏/小说/影视）</option>
+                <option value="real_person">现实人物（真实存在的人）</option>
+                <option value="original_character">原创人物（OC）</option>
+                <option value="synthetic_persona">合成人格（综合创造/AI 模板）</option>
+              </select>
+            </label>
+            <label id="pcWorkWrap">作品 / 世界观
+              <input id="pcWorkUniverse" placeholder="例如：雾港来信 / 某部小说或游戏">
+            </label>
+          </div>
+          <div class="row" id="pcRealFields" hidden>
+            <label>生存状态
+              <select id="pcLifeStatus">
+                <option value="unknown">自动判断</option>
+                <option value="living">在世</option>
+                <option value="deceased">已故</option>
+              </select>
+            </label>
+            <label>资料性质
+              <select id="pcPrivacyScope">
+                <option value="public">公开人物</option>
+                <option value="private">私人人物</option>
+              </select>
+            </label>
+          </div>
+          <label>备注 / 研究要求
+            <textarea id="pcNotes" rows="3" placeholder="例如：以我上传的聊天记录为主要依据；不要联网；重点关注关系模式与表达习惯；这是作品角色而非现实同名人物。"></textarea>
+          </label>
+          <div class="row three">
+            <label>出生日期（可选）<input id="pcBirth" type="date"></label>
+            <label>去世日期（可选）<input id="pcDeath" type="date"></label>
+            <label>知识截止（可选）<input id="pcCutoff" type="date"></label>
+          </div>
+          <p class="hint date-hint">以上三个日期都是可选项，不知道或不需要可以留空，不会影响人格创建。</p>
+
+          <h3 class="section-title">研究策略</h3>
+          <div class="row">
+            <label>研究方式 *
+              <select id="pcResearchMode">
+                <option value="auto">自动选择（推荐）</option>
+                <option value="web">联网深度研究</option>
+                <option value="local">本地资料</option>
+                <option value="hybrid">联网 + 本地资料</option>
+                <option value="guided_interview">本地资料 + 引导访谈</option>
+                <option value="author_defined">手工设定 / 无联网</option>
+              </select>
+            </label>
+            <label>公开研究策略
+              <select id="pcPolicy">
+                <option value="deep">Deep（自适应，至少 30，目标 60+）</option>
+                <option value="standard">Standard（约 25 个独立来源）</option>
+                <option value="exhaustive">Exhaustive（100+，持续扩展）</option>
+                <option value="custom">Custom（高级）</option>
+              </select>
+            </label>
+          </div>
+          <div class="row">
+            <label>执行器
+              <select id="pcAgent"></select>
+            </label>
+            <label>模型
+              <select id="pcModel"></select>
+            </label>
+          </div>
+          <div class="row">
+            <label>思考强度
+              <select id="pcReasoning"><option value="">默认（当前适配器不支持）</option></select>
+            </label>
+            <label>语义分析策略
+              <select id="pcGateMode">
+                <option value="auto">自动（推荐）</option>
+                <option value="full">完整保真</option>
+                <option value="balanced">平衡</option>
+                <option value="fast">快速</option>
+              </select>
+            </label>
+          </div>
+          <div id="pcCustomPolicy" class="custom-policy" hidden>
+            <label>最低独立来源<input id="pcCustomMin" type="number" min="1" value="30"></label>
+            <label>目标来源<input id="pcCustomTarget" type="number" min="1" value="60"></label>
+            <label>软预算<input id="pcCustomSoft" type="number" min="1" value="100"></label>
+            <label>硬预算<input id="pcCustomHard" type="number" min="1" value="150"></label>
+            <label>来源类别<input id="pcCustomCategories" type="number" min="1" value="6"></label>
+            <label>每维证据<input id="pcCustomDimension" type="number" min="1" value="4"></label>
+          </div>
+          <p id="pcCapabilityHint" class="warn" hidden></p>
+          <div class="actions">
+            <button id="pcValidateResearch" class="ghost" type="button">验证当前执行器的联网能力</button>
+          </div>
+          <p id="pcOcWarning" class="hint" hidden>原创人物若开启联网，只用于时代、职业与世界观等背景参考，不会搜索同名现实人物污染人物生平。</p>
+
+          <h3 class="section-title">本地资料与文件</h3>
+          <label>资料文本（每行一段；空行也可）
+            <textarea id="pcMaterials" rows="7" placeholder="聊天记录、日记、访谈文字、角色设定、剧情片段……资料越具体，八维覆盖越完整。"></textarea>
+          </label>
+          <label>上传文件（txt/md/json/jsonl/csv/html/pdf/docx）
+            <input id="pcFiles" type="file" multiple accept=".txt,.md,.json,.jsonl,.csv,.html,.htm,.pdf,.docx">
+          </label>
+          <div id="pcUploads" class="upload-list"></div>
+          <label class="inline-check">
+            <input type="checkbox" id="pcRemoteConsent"> 允许将私人资料发送给远程模型 Provider
+          </label>
+          <p class="hint">私人/现实人物 + AstrBot 远程模型时，必须勾选该项。文件会上传到插件自己的数据目录。</p>
+
+          <div class="actions create-actions">
+            <button id="pcStart" class="primary" type="button">开始创建</button>
+            <button id="pcReset" class="ghost" type="button">清空</button>
+            <span id="pcHint" class="muted small"></span>
+          </div>
+        </div>
+
+        <aside class="card progress-card">
+          <div class="card-head">
+            <h2>任务进度</h2>
+            <span id="pcJobStatus" class="chip">未开始</span>
+          </div>
+          <p id="pcProgressEmpty" class="muted">填写上面的资料后开始。完整制作可能持续数分钟到数十分钟，关闭页面不会取消后台任务。</p>
+          <div id="pcProgressBox" hidden>
+            <div class="progress-head">
+              <span id="pcStage">准备中</span>
+              <span id="pcPercent">0%</span>
+            </div>
+            <div class="progress-track"><div id="pcBar" class="progress-bar"></div></div>
+            <p id="pcMessage" class="muted small"></p>
+            <div class="metrics">
+              <span class="metric">来源 <b id="pcSources">0</b></span>
+              <span class="metric">独立来源 <b id="pcIndependent">—</b></span>
+              <span class="metric">预算 <b id="pcBudget">—</b></span>
+              <span class="metric">八维 <b id="pcDimensions">0/8</b></span>
+              <span class="metric">Life stages <b id="pcLifeStages">—</b></span>
+              <span class="metric">Gaps <b id="pcGaps">0</b></span>
+              <span class="metric">Evidence units <b id="pcEvidence">—</b></span>
+              <span class="metric">Fused <b id="pcFused">—</b></span>
+              <span class="metric">Contradictions <b id="pcContradictions">—</b></span>
+              <span class="metric">Records <b id="pcRecords">—</b></span>
+              <span class="metric">Batches <b id="pcBatches">—</b></span>
+            </div>
+            <p id="pcStopReason" class="hint"></p>
+            <details id="pcCoverageDetails" class="details-block">
+              <summary>查看覆盖缺口 / 覆盖率</summary>
+              <pre id="pcCoverage"></pre>
+            </details>
+            <details id="pcMaterialDetails" class="details-block">
+              <summary>私有材料 Evidence Layer</summary>
+              <pre id="pcMaterialStats"></pre>
+            </details>
+            <div class="runtime-tags">
+              <span class="tag" id="pcRuntimeAgent">Agent: —</span>
+              <span class="tag" id="pcRuntimeModel">Model: —</span>
+              <span class="tag" id="pcRuntimeStage">Stage: —</span>
+            </div>
+            <div id="pcInterview" class="interview-box" hidden>
+              <p id="pcInterviewQuestion"></p>
+              <textarea id="pcInterviewAnswer" rows="3" placeholder="不知道可以填写：不清楚"></textarea>
+              <button id="pcInterviewSubmit" class="ghost" type="button">提交回答</button>
+            </div>
+            <div class="actions job-actions">
+              <button id="pcPause" class="ghost" type="button" hidden>暂停</button>
+              <button id="pcResume" class="ghost" type="button" hidden>继续</button>
+              <button id="pcRetry" class="ghost" type="button" hidden>重试</button>
+              <button id="pcContinue" class="ghost" type="button" hidden>继续研究</button>
+              <button id="pcSwitchModel" class="ghost" type="button" hidden>用当前模型继续</button>
+              <button id="pcCancel" class="danger" type="button" hidden>取消任务</button>
+            </div>
+            <p id="pcError" class="error" hidden></p>
+            <div class="events-head">最近事件</div>
+            <div id="pcEvents" class="events"></div>
+            <details class="details-block">
+              <summary>完整任务数据</summary>
+              <pre id="pcRaw"></pre>
+            </details>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <section id="tab-tasks" class="tab-panel" hidden>
+      <div class="library-head">
+        <div>
+          <h2>任务中心</h2>
+          <p class="muted small">关闭进度窗口不会取消后台任务；这里可以重新打开运行中、暂停或失败的任务。</p>
+        </div>
+        <button id="refreshJobs" class="ghost" type="button">刷新</button>
+      </div>
+      <div id="jobList" class="job-list"></div>
+    </section>
+
+    <section id="tab-library" class="tab-panel" hidden>
+      <div class="library-head">
+        <div>
+          <h2>人格库</h2>
+          <p class="muted small">“使用”会把 continuum 人格编译成 AstrBot 系统提示词并设为默认人格；也可以去原生“人格设定”里单独选择。</p>
+        </div>
+        <button id="refreshPersonas" class="ghost" type="button">刷新</button>
+      </div>
+      <div id="personaLibrary" class="library-grid"></div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" hidden></div>
+  <div id="confirmOverlay" class="overlay" hidden>
+    <div class="dialog" role="dialog" aria-modal="true">
+      <h3 id="confirmTitle">确认</h3>
+      <p id="confirmMessage"></p>
+      <div class="actions dialog-actions">
+        <button id="confirmCancel" class="ghost" type="button">取消</button>
+        <button id="confirmOk" class="danger" type="button">确认</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
