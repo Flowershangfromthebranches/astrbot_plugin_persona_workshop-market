@@ -3,7 +3,7 @@ display_name: 人格工坊
 short_desc: 把 persona-continuum 的完整人格制作、Room 动态人格和记忆联动接入 AstrBot。
 desc: 用 AstrBot 模型或本地 CLI 制作人格，保留 continuum 的资料研究、八维提取、审阅与编译；使用人格时以隐藏 Room 动态注入情绪、需求、关系和记忆，并支持 LivingMemory、人格工具与可选静默会诊。
 help: 打开左侧“扩展功能 → 人格工坊”，填写角色资料生成人格；生成后可在人格库里设为默认人格。
-version: 0.3.0
+version: 0.3.1
 author: Flowershangfromthebranches
 repo: https://github.com/Flowershangfromthebranches/astrbot_plugin_persona_workshop-market
 social_link: https://github.com/Flowershangfromthebranches
