@@ -5,7 +5,7 @@ desc: 用 AstrBot 模型或本地 CLI 制作人格，保留 continuum 的资料�
 help: 打开左侧“扩展功能 → 人格工坊”，填写角色资料生成人格；生成后可在人格库里设为默认人格。
 version: 0.3.0
 author: Flowershangfromthebranches
-repo: https://github.com/Flowershangfromthebranches/astrbot_plugin_persona_workshop
+repo: https://github.com/Flowershangfromthebranches/astrbot_plugin_persona_workshop-market
 social_link: https://github.com/Flowershangfromthebranches
 astrbot_version: ">=4.29.4"
 support_platforms:
